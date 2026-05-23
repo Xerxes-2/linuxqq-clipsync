@@ -373,7 +373,10 @@ fn main() {
             w_data
         };
 
-        let target_t = sync_mime;
+        let target_t = match sync_mime {
+            "text/plain;charset=utf-8" | "text/plain" => "UTF8_STRING",
+            other => other,
+        };
 
         if write_clipboard(
             "xclip",
