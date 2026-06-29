@@ -15,6 +15,30 @@ enum Direction {
     W2X,
 }
 
+impl Direction {
+    fn tag(self) -> &'static str {
+        match self {
+            Direction::X2W => "X2W",
+            Direction::W2X => "W2X",
+        }
+    }
+
+    // 目标侧名称，仅用于日志
+    fn target(self) -> &'static str {
+        match self {
+            Direction::X2W => "Wayland",
+            Direction::W2X => "X11",
+        }
+    }
+
+    fn opposite(self) -> Direction {
+        match self {
+            Direction::X2W => Direction::W2X,
+            Direction::W2X => Direction::X2W,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProcessMode {
     UriList,
@@ -26,6 +50,18 @@ struct SyncState {
     last_dir: Option<Direction>,
     last_time: Option<Instant>,
     last_sync_hash: Option<u128>,
+}
+
+// 一个同步方向的注入配置：触发差异全部收敛到函数指针，循环体共用 handle_change。
+// pick 返回 (读取类型, 写入类型, 处理模式)；两个方向各自的 MIME 表保留，因为源/目标
+// 表示本就不对称（X 侧特有 gnome-copied-files / UTF8_STRING 源类型等）。
+#[derive(Clone, Copy)]
+struct SyncConfig {
+    dir: Direction,
+    list_types: fn() -> Vec<u8>,
+    pick: fn(&str) -> Option<(&'static str, &'static str, ProcessMode)>,
+    read_data: fn(&str) -> Vec<u8>,
+    write_data: fn(&str, &[u8]) -> bool,
 }
 
 fn log(level: &str, msg: &str) {
@@ -129,6 +165,126 @@ fn write_clipboard(cmd: &str, args: &[&str], data: &[u8]) -> bool {
     false
 }
 
+// uri-list 规范化：丢弃 copy/cut 行，裸路径补成 file:/// 形式
+fn rewrite_uri_list(data: &[u8]) -> Vec<u8> {
+    let s = String::from_utf8_lossy(data);
+    let mut res = String::new();
+    for line in s.lines() {
+        if line == "copy" || line == "cut" {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('/') {
+            res.push_str("file:///");
+            res.push_str(rest);
+        } else {
+            res.push_str(line);
+        }
+        res.push('\n');
+    }
+    res.into_bytes()
+}
+
+// X → Wayland 的类型选择。读取类型是 X 侧的源表示，写入类型是 Wayland 侧目标。
+fn pick_x2w(types: &str) -> Option<(&'static str, &'static str, ProcessMode)> {
+    let plan = if types.contains("x-special/gnome-copied-files") {
+        (
+            "x-special/gnome-copied-files",
+            "text/uri-list",
+            ProcessMode::UriList,
+        )
+    } else if types.contains("application/x-qt-image") || types.contains("text/uri-list") {
+        ("text/uri-list", "text/uri-list", ProcessMode::UriList)
+    } else if types.contains("image/png") {
+        ("image/png", "image/png", ProcessMode::Raw)
+    } else if types.contains("image/jpeg") {
+        ("image/jpeg", "image/jpeg", ProcessMode::Raw)
+    } else if types.contains("text/plain;charset=utf-8") {
+        ("text/plain;charset=utf-8", "text/plain", ProcessMode::Text)
+    } else if types.contains("UTF8_STRING") {
+        ("UTF8_STRING", "text/plain", ProcessMode::Text)
+    } else if types.contains("text/plain") {
+        ("text/plain", "text/plain", ProcessMode::Text)
+    } else if types.contains("text/html") {
+        ("text/html", "text/html", ProcessMode::Raw)
+    } else {
+        return None;
+    };
+    Some(plan)
+}
+
+// Wayland → X 的类型选择。读取类型即 Wayland 源类型；写入 xclip 时文本统一用 UTF8_STRING。
+fn pick_w2x(types: &str) -> Option<(&'static str, &'static str, ProcessMode)> {
+    let (read_type, mode) =
+        if types.contains("application/x-qt-image") || types.contains("text/uri-list") {
+            ("text/uri-list", ProcessMode::UriList)
+        } else if types.contains("image/png") {
+            ("image/png", ProcessMode::Raw)
+        } else if types.contains("image/jpeg") {
+            ("image/jpeg", ProcessMode::Raw)
+        } else if types.contains("text/plain;charset=utf-8") {
+            ("text/plain;charset=utf-8", ProcessMode::Text)
+        } else if types.contains("text/plain") {
+            ("text/plain", ProcessMode::Text)
+        } else if types.contains("text/html") {
+            ("text/html", ProcessMode::Raw)
+        } else {
+            return None;
+        };
+    let write_type = match read_type {
+        "text/plain;charset=utf-8" | "text/plain" => "UTF8_STRING",
+        other => other,
+    };
+    Some((read_type, write_type, mode))
+}
+
+// 单次剪贴板变化的共用处理：回音抑制 → 选型 → 读取 → 去重 → 写入 → 记录。
+fn handle_change(state: &Mutex<SyncState>, cfg: &SyncConfig) {
+    // 优化 2：前置全局排他锁，利用短路求值拦截回音
+    let mut st = state.lock().unwrap();
+    if st.last_dir == Some(cfg.dir.opposite())
+        && st.last_time.is_some_and(|t| t.elapsed() < ECHO_WINDOW)
+    {
+        return;
+    }
+
+    let types_raw = (cfg.list_types)();
+    let types_str = String::from_utf8_lossy(&types_raw);
+    let Some((read_type, write_type, mode)) = (cfg.pick)(&types_str) else {
+        return;
+    };
+
+    let data = (cfg.read_data)(read_type);
+    let Some(current_hash) = calc_hash(&data, mode) else {
+        return;
+    };
+
+    // 优化 3：直接依靠记录的 hash 防环，不做二次目标查壳
+    if st.last_sync_hash == Some(current_hash) {
+        return;
+    }
+
+    log(
+        cfg.dir.tag(),
+        &format!(
+            "写入 {}... (Hash: {:08x})",
+            cfg.dir.target(),
+            (current_hash >> 96) as u32
+        ),
+    );
+    st.last_dir = Some(cfg.dir);
+    st.last_time = Some(Instant::now());
+
+    let payload = if mode == ProcessMode::UriList {
+        rewrite_uri_list(&data)
+    } else {
+        data
+    };
+
+    if (cfg.write_data)(write_type, &payload) {
+        st.last_sync_hash = Some(current_hash);
+    }
+}
+
 fn get_xdg_runtime_dir() -> String {
     if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
         return dir;
@@ -216,95 +372,20 @@ fn main() {
     // ==========================================
     // X2W 线程
     // ==========================================
+    let x2w_cfg = SyncConfig {
+        dir: Direction::X2W,
+        list_types: || read_clipboard("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]),
+        pick: pick_x2w,
+        read_data: |t| read_clipboard("xclip", &["-sel", "clip", "-o", "-t", t]),
+        write_data: |t, d| write_clipboard("wl-copy", &["-t", t], d),
+    };
     let state_x2w = Arc::clone(&shared_state);
     thread::spawn(move || {
         log("INFO", "=== [X2W] 线程启动 ===");
         loop {
             let _ = Command::new("clipnotify").status();
             thread::sleep(Duration::from_millis(30));
-
-            // 优化 2：【前置全局排他锁】在此处锁死状态，彻底杜绝并发竞争，利用短路求值拦截回音！
-            let mut state = state_x2w.lock().unwrap();
-            if state.last_dir == Some(Direction::W2X)
-                && state.last_time.is_some_and(|t| t.elapsed() < ECHO_WINDOW)
-            {
-                continue;
-            }
-
-            let types_raw =
-                read_clipboard("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]);
-            let types_str = String::from_utf8_lossy(&types_raw);
-
-            let (source_mime, sync_mime, process_mode) =
-                if types_str.contains("x-special/gnome-copied-files") {
-                    (
-                        "x-special/gnome-copied-files",
-                        "text/uri-list",
-                        ProcessMode::UriList,
-                    )
-                } else if types_str.contains("application/x-qt-image")
-                    || types_str.contains("text/uri-list")
-                {
-                    ("text/uri-list", "text/uri-list", ProcessMode::UriList)
-                } else if types_str.contains("image/png") {
-                    ("image/png", "image/png", ProcessMode::Raw)
-                } else if types_str.contains("image/jpeg") {
-                    ("image/jpeg", "image/jpeg", ProcessMode::Raw)
-                } else if types_str.contains("text/plain;charset=utf-8") {
-                    ("text/plain;charset=utf-8", "text/plain", ProcessMode::Text)
-                } else if types_str.contains("UTF8_STRING") {
-                    ("UTF8_STRING", "text/plain", ProcessMode::Text)
-                } else if types_str.contains("text/plain") {
-                    ("text/plain", "text/plain", ProcessMode::Text)
-                } else if types_str.contains("text/html") {
-                    ("text/html", "text/html", ProcessMode::Raw)
-                } else {
-                    continue;
-                };
-
-            let x_data = read_clipboard("xclip", &["-sel", "clip", "-o", "-t", source_mime]);
-            let Some(current_hash) = calc_hash(&x_data, process_mode) else {
-                continue;
-            };
-
-            // 优化 3：移除极其冗余的二次目标查壳（w_check_data），直接依靠记录的 hash 防环
-            if state.last_sync_hash == Some(current_hash) {
-                continue;
-            }
-
-            log(
-                "X2W",
-                &format!(
-                    "写入 Wayland... (Hash: {:08x})",
-                    (current_hash >> 96) as u32
-                ),
-            );
-            state.last_dir = Some(Direction::X2W);
-            state.last_time = Some(Instant::now());
-
-            let write_data = if process_mode == ProcessMode::UriList {
-                let s = String::from_utf8_lossy(&x_data);
-                let mut res = String::new();
-                for line in s.lines() {
-                    if line == "copy" || line == "cut" {
-                        continue;
-                    }
-                    if line.starts_with('/') {
-                        res.push_str("file:///");
-                        res.push_str(&line[1..]);
-                    } else {
-                        res.push_str(line);
-                    }
-                    res.push('\n');
-                }
-                res.into_bytes()
-            } else {
-                x_data
-            };
-
-            if write_clipboard("wl-copy", &["-t", sync_mime], &write_data) {
-                state.last_sync_hash = Some(current_hash);
-            }
+            handle_change(&state_x2w, &x2w_cfg);
         }
     });
 
@@ -314,6 +395,14 @@ fn main() {
     // ==========================================
     // W2X 主线程
     // ==========================================
+    let w2x_cfg = SyncConfig {
+        dir: Direction::W2X,
+        list_types: || read_clipboard("wl-paste", &["--list-types"]),
+        pick: pick_w2x,
+        read_data: |t| read_clipboard("wl-paste", &["-n", "-t", t]),
+        write_data: |t, d| write_clipboard("xclip", &["-sel", "clip", "-i", "-t", t], d),
+    };
+
     let mut wl_watch = Command::new("wl-paste")
         .args(["--watch", "echo"])
         .stdout(Stdio::piped())
@@ -325,85 +414,7 @@ fn main() {
 
     for _line in reader.lines() {
         thread::sleep(Duration::from_millis(30));
-
-        // 优化 2：【前置全局排他锁】同样提到最前面，防止 XWayland 带来的回音击穿
-        let mut state = shared_state.lock().unwrap();
-        if state.last_dir == Some(Direction::X2W)
-            && state.last_time.is_some_and(|t| t.elapsed() < ECHO_WINDOW)
-        {
-            continue;
-        }
-
-        let types_raw = read_clipboard("wl-paste", &["--list-types"]);
-        let types_str = String::from_utf8_lossy(&types_raw);
-
-        let (sync_mime, process_mode) = if types_str.contains("application/x-qt-image")
-            || types_str.contains("text/uri-list")
-        {
-            ("text/uri-list", ProcessMode::UriList)
-        } else if types_str.contains("image/png") {
-            ("image/png", ProcessMode::Raw)
-        } else if types_str.contains("image/jpeg") {
-            ("image/jpeg", ProcessMode::Raw)
-        } else if types_str.contains("text/plain;charset=utf-8") {
-            ("text/plain;charset=utf-8", ProcessMode::Text)
-        } else if types_str.contains("text/plain") {
-            ("text/plain", ProcessMode::Text)
-        } else if types_str.contains("text/html") {
-            ("text/html", ProcessMode::Raw)
-        } else {
-            continue;
-        };
-
-        let w_data = read_clipboard("wl-paste", &["-n", "-t", sync_mime]);
-        let Some(current_hash) = calc_hash(&w_data, process_mode) else {
-            continue;
-        };
-
-        // 优化 3：移除 x_check_data 的大量多余 IO。
-        if state.last_sync_hash == Some(current_hash) {
-            continue;
-        }
-
-        log(
-            "W2X",
-            &format!("写入 X11... (Hash: {:08x})", (current_hash >> 96) as u32),
-        );
-        state.last_dir = Some(Direction::W2X);
-        state.last_time = Some(Instant::now());
-
-        let write_data = if process_mode == ProcessMode::UriList {
-            let s = String::from_utf8_lossy(&w_data);
-            let mut res = String::new();
-            for line in s.lines() {
-                if line == "copy" || line == "cut" {
-                    continue;
-                }
-                if line.starts_with('/') {
-                    res.push_str("file:///");
-                    res.push_str(&line[1..]);
-                } else {
-                    res.push_str(line);
-                }
-                res.push('\n');
-            }
-            res.into_bytes()
-        } else {
-            w_data
-        };
-
-        let target_t = match sync_mime {
-            "text/plain;charset=utf-8" | "text/plain" => "UTF8_STRING",
-            other => other,
-        };
-
-        if write_clipboard(
-            "xclip",
-            &["-sel", "clip", "-i", "-t", target_t],
-            &write_data,
-        ) {
-            state.last_sync_hash = Some(current_hash);
-        }
+        handle_change(&shared_state, &w2x_cfg);
     }
 
     log("ERROR", "W2X 监听意外终止，触发退出...");
