@@ -6,34 +6,44 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_128;
 
-struct SyncState {
-    last_dir: String,
-    last_time: i64,
-    last_sync_hash: u128,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    X2W,
+    W2X,
 }
 
-const EMPTY_HASH: u128 = 0;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcessMode {
+    UriList,
+    Text,
+    Raw,
+}
+
+struct SyncState {
+    last_dir: Option<Direction>,
+    last_time: Option<Instant>,
+    last_sync_hash: Option<u128>,
+}
 
 fn log(level: &str, msg: &str) {
     let now = Utc::now().format("%H:%M:%S").to_string();
     println!("[{}] [{}] {}", now, level, msg);
 }
 
-fn get_ms() -> i64 {
-    Utc::now().timestamp_millis()
-}
+// 回音窗口阈值：刚被对向写入 1 秒内的变化视为回音，忽略
+const ECHO_WINDOW: Duration = Duration::from_secs(1);
 
 // 优化 1：零拷贝 Hash，拒绝为大图片分配多余内存
-fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
+fn calc_hash(data: &[u8], process_mode: ProcessMode) -> Option<u128> {
     if data.is_empty() {
-        return EMPTY_HASH;
+        return None;
     }
 
     match process_mode {
-        "uri-list" => {
+        ProcessMode::UriList => {
             let s = String::from_utf8_lossy(data);
             let mut result = String::new();
             for line in s.lines() {
@@ -45,12 +55,12 @@ fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
             }
             let processed = result.replace("\n", "").replace("\r", "").into_bytes();
             if processed.is_empty() {
-                EMPTY_HASH
+                None
             } else {
-                xxh3_128(&processed)
+                Some(xxh3_128(&processed))
             }
         }
-        "text" => {
+        ProcessMode::Text => {
             let s = String::from_utf8_lossy(data);
             let result: String = s
                 .chars()
@@ -58,12 +68,12 @@ fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
                 .collect();
             let processed = result.into_bytes();
             if processed.is_empty() {
-                EMPTY_HASH
+                None
             } else {
-                xxh3_128(&processed)
+                Some(xxh3_128(&processed))
             }
         }
-        _ => xxh3_128(data), // 对于图片直接 Hash 原数组，绝对不 clone！
+        ProcessMode::Raw => Some(xxh3_128(data)), // 对于图片直接 Hash 原数组，绝对不 clone！
     }
 }
 
@@ -198,9 +208,9 @@ fn main() {
     }
 
     let shared_state = Arc::new(Mutex::new(SyncState {
-        last_dir: String::new(),
-        last_time: 0,
-        last_sync_hash: EMPTY_HASH,
+        last_dir: None,
+        last_time: None,
+        last_sync_hash: None,
     }));
 
     // ==========================================
@@ -215,8 +225,9 @@ fn main() {
 
             // 优化 2：【前置全局排他锁】在此处锁死状态，彻底杜绝并发竞争，利用短路求值拦截回音！
             let mut state = state_x2w.lock().unwrap();
-            let now = get_ms();
-            if state.last_dir == "W2X" && (now - state.last_time < 1000) {
+            if state.last_dir == Some(Direction::W2X)
+                && state.last_time.is_some_and(|t| t.elapsed() < ECHO_WINDOW)
+            {
                 continue;
             }
 
@@ -226,35 +237,38 @@ fn main() {
 
             let (source_mime, sync_mime, process_mode) =
                 if types_str.contains("x-special/gnome-copied-files") {
-                    ("x-special/gnome-copied-files", "text/uri-list", "uri-list")
+                    (
+                        "x-special/gnome-copied-files",
+                        "text/uri-list",
+                        ProcessMode::UriList,
+                    )
                 } else if types_str.contains("application/x-qt-image")
                     || types_str.contains("text/uri-list")
                 {
-                    ("text/uri-list", "text/uri-list", "uri-list")
+                    ("text/uri-list", "text/uri-list", ProcessMode::UriList)
                 } else if types_str.contains("image/png") {
-                    ("image/png", "image/png", "raw")
+                    ("image/png", "image/png", ProcessMode::Raw)
                 } else if types_str.contains("image/jpeg") {
-                    ("image/jpeg", "image/jpeg", "raw")
+                    ("image/jpeg", "image/jpeg", ProcessMode::Raw)
                 } else if types_str.contains("text/plain;charset=utf-8") {
-                    ("text/plain;charset=utf-8", "text/plain", "text")
+                    ("text/plain;charset=utf-8", "text/plain", ProcessMode::Text)
                 } else if types_str.contains("UTF8_STRING") {
-                    ("UTF8_STRING", "text/plain", "text")
+                    ("UTF8_STRING", "text/plain", ProcessMode::Text)
                 } else if types_str.contains("text/plain") {
-                    ("text/plain", "text/plain", "text")
+                    ("text/plain", "text/plain", ProcessMode::Text)
                 } else if types_str.contains("text/html") {
-                    ("text/html", "text/html", "raw")
+                    ("text/html", "text/html", ProcessMode::Raw)
                 } else {
                     continue;
                 };
 
             let x_data = read_clipboard("xclip", &["-sel", "clip", "-o", "-t", source_mime]);
-            let current_hash = calc_hash(&x_data, process_mode);
-            if current_hash == EMPTY_HASH {
+            let Some(current_hash) = calc_hash(&x_data, process_mode) else {
                 continue;
-            }
+            };
 
             // 优化 3：移除极其冗余的二次目标查壳（w_check_data），直接依靠记录的 hash 防环
-            if current_hash == state.last_sync_hash {
+            if state.last_sync_hash == Some(current_hash) {
                 continue;
             }
 
@@ -265,10 +279,10 @@ fn main() {
                     (current_hash >> 96) as u32
                 ),
             );
-            state.last_dir = "X2W".to_string();
-            state.last_time = get_ms();
+            state.last_dir = Some(Direction::X2W);
+            state.last_time = Some(Instant::now());
 
-            let write_data = if process_mode == "uri-list" {
+            let write_data = if process_mode == ProcessMode::UriList {
                 let s = String::from_utf8_lossy(&x_data);
                 let mut res = String::new();
                 for line in s.lines() {
@@ -289,7 +303,7 @@ fn main() {
             };
 
             if write_clipboard("wl-copy", &["-t", sync_mime], &write_data) {
-                state.last_sync_hash = current_hash;
+                state.last_sync_hash = Some(current_hash);
             }
         }
     });
@@ -314,8 +328,9 @@ fn main() {
 
         // 优化 2：【前置全局排他锁】同样提到最前面，防止 XWayland 带来的回音击穿
         let mut state = shared_state.lock().unwrap();
-        let now = get_ms();
-        if state.last_dir == "X2W" && (now - state.last_time < 1000) {
+        if state.last_dir == Some(Direction::X2W)
+            && state.last_time.is_some_and(|t| t.elapsed() < ECHO_WINDOW)
+        {
             continue;
         }
 
@@ -325,29 +340,28 @@ fn main() {
         let (sync_mime, process_mode) = if types_str.contains("application/x-qt-image")
             || types_str.contains("text/uri-list")
         {
-            ("text/uri-list", "uri-list")
+            ("text/uri-list", ProcessMode::UriList)
         } else if types_str.contains("image/png") {
-            ("image/png", "raw")
+            ("image/png", ProcessMode::Raw)
         } else if types_str.contains("image/jpeg") {
-            ("image/jpeg", "raw")
+            ("image/jpeg", ProcessMode::Raw)
         } else if types_str.contains("text/plain;charset=utf-8") {
-            ("text/plain;charset=utf-8", "text")
+            ("text/plain;charset=utf-8", ProcessMode::Text)
         } else if types_str.contains("text/plain") {
-            ("text/plain", "text")
+            ("text/plain", ProcessMode::Text)
         } else if types_str.contains("text/html") {
-            ("text/html", "raw")
+            ("text/html", ProcessMode::Raw)
         } else {
             continue;
         };
 
         let w_data = read_clipboard("wl-paste", &["-n", "-t", sync_mime]);
-        let current_hash = calc_hash(&w_data, process_mode);
-        if current_hash == EMPTY_HASH {
+        let Some(current_hash) = calc_hash(&w_data, process_mode) else {
             continue;
-        }
+        };
 
         // 优化 3：移除 x_check_data 的大量多余 IO。
-        if current_hash == state.last_sync_hash {
+        if state.last_sync_hash == Some(current_hash) {
             continue;
         }
 
@@ -355,10 +369,10 @@ fn main() {
             "W2X",
             &format!("写入 X11... (Hash: {:08x})", (current_hash >> 96) as u32),
         );
-        state.last_dir = "W2X".to_string();
-        state.last_time = get_ms();
+        state.last_dir = Some(Direction::W2X);
+        state.last_time = Some(Instant::now());
 
-        let write_data = if process_mode == "uri-list" {
+        let write_data = if process_mode == ProcessMode::UriList {
             let s = String::from_utf8_lossy(&w_data);
             let mut res = String::new();
             for line in s.lines() {
@@ -388,7 +402,7 @@ fn main() {
             &["-sel", "clip", "-i", "-t", target_t],
             &write_data,
         ) {
-            state.last_sync_hash = current_hash;
+            state.last_sync_hash = Some(current_hash);
         }
     }
 
