@@ -312,16 +312,16 @@ fn main() {
         if let Ok(entries) = fs::read_dir(&xdg_runtime_dir) {
             for entry in entries.flatten() {
                 let file_name = entry.file_name().into_string().unwrap_or_default();
-                if file_name.starts_with("wayland-") && !file_name.contains('.') {
-                    if Command::new("wl-paste")
+                if file_name.starts_with("wayland-")
+                    && !file_name.contains('.')
+                    && Command::new("wl-paste")
                         .env("WAYLAND_DISPLAY", &file_name)
                         .arg("--list-types")
                         .output()
                         .is_ok()
-                    {
-                        wayland_display = file_name;
-                        break;
-                    }
+                {
+                    wayland_display = file_name;
+                    break;
                 }
             }
         }
@@ -331,8 +331,8 @@ fn main() {
         if let Ok(entries) = fs::read_dir("/tmp/.X11-unix") {
             for entry in entries.flatten() {
                 let file_name = entry.file_name().into_string().unwrap_or_default();
-                if file_name.starts_with('X') {
-                    let test_d = format!(":{}", &file_name[1..]);
+                if let Some(stripped) = file_name.strip_prefix('X') {
+                    let test_d = format!(":{}", stripped);
                     if Command::new("xclip")
                         .env("DISPLAY", &test_d)
                         .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
