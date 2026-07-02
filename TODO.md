@@ -13,9 +13,9 @@
 - [x] 提取 uri-list 重写：`fn rewrite_uri_list(data: &[u8]) -> Vec<u8>`（消除两段逐字重复，顺带修掉 manual_strip）。
 - [x] 合并两条循环为共用 `handle_change(state, &SyncConfig)`，方向差异（触发源、reader/writer 命令、MIME 表）经 `SyncConfig` 的函数指针注入。
 
-## 3. 收紧锁粒度
-- [ ] 临界区只保护 `last_dir` / `last_time` / `last_sync_hash` 的读写，**不要**把 `read_clipboard`（spawn + wait 阻塞）圈进 `MutexGuard`。
-- [ ] 回音抑制（时间窗 + hash）逻辑提成小函数，两方向共用。
+## 3. 收紧锁粒度 — 评估后放弃（有意保留宽锁）
+- [x] 结论：**不收紧**。宽锁保证「写 `last_sync_hash` 先于任何回音处理」是原子的，hash 防环因此绝对武装；收紧后该保证降级为只靠时间窗兜底。剪贴板是人手速操作，无并发吞吐收益，纯亏语义。已在 `handle_change` 处注释为有意设计。
+- [x] 「回音逻辑提成共用函数」在第 2 块已随 `handle_change` 完成。
 
 ## 4. 错误处理 / 可观测性
 - [ ] `read_clipboard` / `write_clipboard` 的静默失败至少 `log("WARN", ...)`，便于排查。

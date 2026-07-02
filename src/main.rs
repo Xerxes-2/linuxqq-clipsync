@@ -238,8 +238,12 @@ fn pick_w2x(types: &str) -> Option<(&'static str, &'static str, ProcessMode)> {
 }
 
 // 单次剪贴板变化的共用处理：回音抑制 → 选型 → 读取 → 去重 → 写入 → 记录。
+//
+// 注意：锁全程持有（含读写剪贴板的子进程阻塞）是**有意**的，不是性能疏忽。
+// 它保证「置 last_sync_hash 先于任何回音被处理」这一步原子完成，hash 防环
+// 因而绝对可靠。剪贴板是人手速操作，两方向几乎不争锁，宽锁无吞吐代价。
 fn handle_change(state: &Mutex<SyncState>, cfg: &SyncConfig) {
-    // 优化 2：前置全局排他锁，利用短路求值拦截回音
+    // 前置排他锁，利用短路求值拦截回音
     let mut st = state.lock().unwrap();
     if st.last_dir == Some(cfg.dir.opposite())
         && st.last_time.is_some_and(|t| t.elapsed() < ECHO_WINDOW)
